@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+#
+# cmux-berth: open a tmux session on a remote machine as a cmux sidebar row,
+# filed under a group named for its repo. Run it from any terminal on the Mac
+# that runs cmux.
+#
+#   cmux-berth                # pick a session from the remote with fzf. Search
+#                             # starts off so single keys act: enter opens, n
+#                             # opens a new shell (as does the first entry),
+#                             # j/k move, / filters, q or esc quits. In filter
+#                             # mode esc goes back to the list. Needs fzf 0.46+.
+#   cmux-berth <session>      # open that session by its exact tmux name
+#   cmux-berth -n [name]      # open a plain shell in ~ on the remote, outside
+#                             # any group; --new works too. Without a name cmux
+#                             # picks workspace-N.
+#   cmux-berth -H <host> ...  # any of the above against another ssh host
+#
+# Settings, highest priority first: the -H flag, then the environment, then
+# ~/.config/cmux-berth/config (key = value lines, parsed, never sourced):
+#
+#   CMUX_BERTH_HOST           host           the ssh host. Required; there is
+#                                            no default
+#   CMUX_BERTH_RENAME_DELAYS  rename_delays  seconds before each late rename
+#                                            (default "2 4")
+#   CMUX_BERTH_CONFIG                        another config file
+#
+# THE LAYOUT IT BUILDS. One sidebar group per repo, one row per tmux session
+# (the main checkout or one worktree), extra tabs in a row for that same
+# worktree. cmux shows an agent's status on the sidebar ROW and a row shows
+# only its most urgent tab, so one row per session gives every agent its own
+# status line.
+#
+# THE SESSION NAMING IT EXPECTS. A worktree's session is <repo>_<worktree> and
+# the main checkout's is <repo>, which is what worktree-orchard creates. The
+# row is named <worktree>, or "main" for the main checkout. Any other session
+# still opens; its row just carries the full session name.
+#
+# WHAT IT DOES, IN ORDER.
+#   1. Asks the remote for its tmux sessions and the repo each one belongs to:
+#      the repo is the directory holding the git common dir, so a worktree
+#      still names its main repo.
+#   2. Finds the group: first by the key cmux-berth gives the groups it creates
+#      (cmux-berth:<repo>, which survives renaming the group), then by a group
+#      named exactly <repo>, so a group made by hand is adopted.
+#   3. If that group already holds a row with this name, selects it and stops.
+#      `cmux ssh` has no reuse flag of its own and makes a new row every call.
+#   4. Otherwise opens a `cmux ssh` row named after the worktree, attaches the
+#      session in it, and adds it to the group, creating the group first when
+#      there is none.
+#   5. Sends the row's name again, twice, a few seconds later. `cmux ssh`
+#      renames the row the moment it exists, but the remote's daemon can push
+#      its own placeholder (workspace-N) back afterwards, and a row left with
+#      the placeholder is one step 3 never finds. Seen in practice; the race
+#      is inferred from cmux's source rather than caught in the act.
+#
+# THE ATTACH RUNS ONCE. cmux types --command into the row's first terminal one
+# time and never again on reconnect. cmux keeps that terminal alive on the
+# remote across lid closes and network changes, so the attach persists; after
+# the remote itself restarts, the row comes back as a plain shell.
+#
+# Session names are limited to letters, digits, dot, dash and underscore. The
+# name is typed into the remote shell, so anything else is refused rather than
+# quoted. The tmux target stays single-quoted because zsh expands an unquoted
+# word starting with = into a command path; bash and fish take it unchanged.
+#
+# Behaviour is pinned by tests/test-cmux-berth.sh; change the two together.
+
+set -uo pipefail
+
+die() { printf 'cmux-berth: %s\n' "$*" >&2; exit 1; }
+
+conf="${CMUX_BERTH_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/cmux-berth/config}"
+cfg() {  # KEY: the last value the config file gives KEY, else nothing
+  [ -f "$conf" ] || return 0
+  awk -v k="$1" '
+    /^[[:space:]]*(#|$)/ { next }
+    { i = index($0, "="); if (i == 0) next
+      key = substr($0, 1, i - 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      if (key != k) next
+      v = substr($0, i + 1); gsub(/^[[:space:]]+|[[:space:]]+$/, "", v) }
+    END { if (v != "") print v }' "$conf"
+}
+
+host=${CMUX_BERTH_HOST:-$(cfg host)}
+case ${1:-} in
+  -H|--host)
+    [ -n "${2:-}" ] || die "usage: cmux-berth -H <host> [session | -n [name]]"
+    host=$2; shift 2 ;;
+  -h|--help)
+    awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"; exit 0 ;;
+esac
+[ -n "$host" ] || die "no host. Pass -H <host>, set CMUX_BERTH_HOST, or put host = <host> in $conf"
+# Set but empty in the environment means no late renames at all.
+if [ -n "${CMUX_BERTH_RENAME_DELAYS+set}" ]; then
+  rename_delays=$CMUX_BERTH_RENAME_DELAYS
+else
+  rename_delays=$(cfg rename_delays); rename_delays=${rename_delays:-2 4}
+fi
+
+for tool in cmux jq ssh; do
+  command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed"
+done
+TAB=$(printf '\t')
+name_ok='^[A-Za-z0-9._-]+$'
+
+# `cmux ssh` reports the row it opened as "OK workspace:<n> surface:<n>".
+new_row_handle() { sed -n 's/^OK \(workspace:[^ ]*\).*/\1/p' | head -1; }
+
+# Step 5 below, as a function so the plain-shell path can use it too.
+rename_late() {  # <workspace handle> <name>
+  (
+    for delay in $rename_delays; do
+      sleep "$delay"
+      cmux workspace rename --workspace "$1" --title "$2"
+    done
+  ) >/dev/null 2>&1 &
+}
+
+open_shell() {  # [name] -- a plain shell in ~ on the box, then exit
+  out=$(cmux ssh "$host" ${1:+--name "$1"}) || die "cmux ssh failed: $out"
+  ws=$(printf '%s\n' "$out" | new_row_handle)
+  [ -n "$ws" ] || die "could not read the new row from cmux: $out"
+  [ -z "${1:-}" ] || rename_late "$ws" "$1"
+  exit 0
+}
+
+case ${1:-} in
+  -n|--new)
+    [ $# -le 2 ] || die "usage: cmux-berth -n [name]"
+    open_shell "${2:-}"
+    ;;
+esac
+
+session=${1:-}
+if [ -n "$session" ] && ! [[ $session =~ $name_ok ]]; then
+  die "refusing session name '$session': only letters, digits, . _ - are allowed"
+fi
+
+# --- 1. sessions on the box, as <session><TAB><repo> --------------------------
+listing=$(ssh "$host" bash -s <<'EOF'
+tmux list-sessions -F '#{session_name}' 2>/dev/null | while IFS= read -r s; do
+  p=$(tmux display-message -p -t "=$s:" '#{pane_current_path}' 2>/dev/null)
+  c=$(git -C "$p" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  if [ -n "$c" ]; then r=$(basename "$(dirname "$c")"); else r=$(basename "$p"); fi
+  printf '%s\t%s\n' "$s" "$r"
+done
+EOF
+) || die "could not list tmux sessions on $host"
+[ -n "$listing" ] || die "no tmux sessions on $host"
+
+if [ -z "$session" ]; then
+  command -v fzf >/dev/null 2>&1 || die "fzf is not installed; pass a session name"
+  # The esc binding reads FZF_PROMPT inside a transform, which arrived in 0.46.
+  fzf_ver=$(fzf --version 2>/dev/null | awk '{print $1}')
+  case "$fzf_ver" in
+    0.[0-9]|0.[0-9].*|0.[1-3][0-9]|0.[1-3][0-9].*|0.4[0-5]|0.4[0-5].*)
+      die "the picker needs fzf 0.46 or newer, and this one is $fzf_ver; pass a session name" ;;
+  esac
+  # One line per session, grouped by repo: the repo padded to the longest repo
+  # name, then the session, then a tab and the plain session name, which is the
+  # part read back. fzf shows only what precedes the tab. Each repo takes the
+  # next color from the palette in alphabetical order, so neighbours never
+  # match; the repo gets the full shade and the session a lighter tint of it.
+  # The first entry opens a plain shell. Its hidden name, :new, can never be a
+  # session, because a colon fails the session-name check. The n key does the
+  # same by leaving a mark file and aborting.
+  mark=$(mktemp) && rm -f "$mark" || die "mktemp failed"
+  pick=$( { printf '+ new shell in ~\t:new\n'
+            printf '%s\n' "$listing" | sort -t "$TAB" -k2,2 -k1,1 \
+    | awk -F'\t' -v esc="$(printf '\033')" '
+        BEGIN {
+          n = split("122;162;247 180;200;250|158;206;106 198;227;168|255;158;100 255;198;165|187;154;247 217;198;251|125;207;255 184;230;255|224;175;104 238;211;168|247;118;142 250;179;192|115;218;202 176;235;226", pal, "|")
+        }
+        { s[NR] = $1; r[NR] = $2; if (length($2) > w) w = length($2)
+          if (!($2 in hue)) hue[$2] = (k++ % n) + 1 }
+        END {
+          for (i = 1; i <= NR; i++) {
+            split(pal[hue[r[i]]], c, " ")
+            printf "%s[38;2;%sm%-" w "s  %s[38;2;%sm%s%s[0m\t%s\n", esc, c[1], r[i], esc, c[2], s[i], esc, s[i]
+          }
+        }'; } \
+    | fzf --ansi --delimiter='\t' --with-nth=1 --disabled \
+        --prompt="session on $host> " \
+        --header='enter open · n new shell · / filter · q quit' \
+        --bind 'j:down' --bind 'k:up' --bind 'q:abort' \
+        --bind "n:execute-silent(touch '$mark')+abort" \
+        --bind '/:unbind(j,k,q,n,/)+enable-search+change-prompt(filter> )' \
+        --bind "esc:transform:case \$FZF_PROMPT in filter*) echo 'clear-query+disable-search+rebind(j,k,q,n,/)+change-prompt(session on $host> )' ;; *) echo abort ;; esac") || true
+  if [ -e "$mark" ]; then rm -f "$mark"; open_shell; fi
+  session=${pick##*"$TAB"}
+  [ "$session" = ":new" ] && open_shell
+  [ -n "$session" ] || exit 1
+  [[ $session =~ $name_ok ]] || die "refusing session name '$session'"
+fi
+
+repo=$(printf '%s\n' "$listing" | awk -F'\t' -v s="$session" '$1 == s {print $2; exit}')
+[ -n "$repo" ] || die "no tmux session named '$session' on $host"
+
+case $session in
+  "$repo")   row=main ;;
+  "$repo"_*) row=${session#"$repo"_} ;;
+  *)         row=$session ;;
+esac
+
+# --- 2 and 3. find the group, and the row if it is already open --------------
+# Rows and groups come from two calls: a row in workspace.list carries no group,
+# and a group in workspace.group.list names its rows by id.
+rows=$(cmux rpc workspace.list) || die "cmux is not reachable; is the app running?"
+groups=$(cmux rpc workspace.group.list) || die "cmux could not list its groups"
+group=$(printf '%s' "$groups" | jq -r --arg key "cmux-berth:$repo" --arg repo "$repo" '
+  [(.groups // [])[] | select(.external_id == $key)][0].id
+  // [(.groups // [])[] | select(.name == $repo)][0].id
+  // empty')
+
+if [ -n "$group" ]; then
+  members=$(printf '%s' "$groups" | jq -c --arg g "$group" \
+    '[(.groups // [])[] | select(.id == $g)][0].member_workspace_ids // []')
+  existing=$(printf '%s' "$rows" | jq -r --argjson m "$members" --arg t "$row" '
+    [(.workspaces // [])[] | select(.title == $t and (.id as $id | $m | index($id)))][0].id // empty')
+  if [ -n "$existing" ]; then
+    cmux rpc workspace.select "$(jq -cn --arg id "$existing" '{workspace_id: $id}')" >/dev/null
+    exit $?
+  fi
+fi
+
+# --- 4. open the row and file it ---------------------------------------------
+out=$(cmux ssh "$host" --name "$row" --command "tmux attach-session -t '=$session'") \
+  || die "cmux ssh failed: $out"
+ws=$(printf '%s\n' "$out" | new_row_handle)
+[ -n "$ws" ] || die "could not read the new row from cmux: $out"
+
+# --- 5. send the name again once the box's placeholder has landed -----------
+# Started before the group step so a failure there still leaves the row named.
+rename_late "$ws" "$row"
+
+# A new group is made the way the sidebar's own "new group" makes one: with no
+# starting row, so cmux gives it a fresh anchor, a shell on the Mac in ~, and
+# lists it under the header like any member. Created --from a session instead,
+# that session became the anchor and rendered as the header, not under it.
+# cmux prints its own error on stderr.
+if [ -z "$group" ]; then
+  made=$(cmux workspace-group create --name "$repo" --idempotency-key "cmux-berth:$repo") \
+    || die "the row opened, but creating the $repo group failed"
+  group=$(printf '%s\n' "$made" | sed -n 's/^OK \(workspace_group:[^ ]*\).*/\1/p' | head -1)
+  [ -n "$group" ] || die "the row opened, but cmux did not report the new group: $made"
+fi
+cmux workspace-group add --group "$group" --workspace "$ws" >/dev/null \
+  || die "the row opened, but adding it to the $repo group failed"

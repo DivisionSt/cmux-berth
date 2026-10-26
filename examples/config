@@ -1,0 +1,10 @@
+# cmux-berth configuration.
+# Copy to ~/.config/cmux-berth/config.
+# key = value, one per line. Lines starting with # are comments.
+
+# The ssh host whose tmux sessions you want as cmux rows. Required, here, in
+# CMUX_BERTH_HOST, or with -H.
+host = my-dev-box
+
+# Seconds to wait before each late rename of a new row (see the README).
+# rename_delays = 2 4

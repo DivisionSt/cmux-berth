@@ -103,6 +103,16 @@ make lint    # shellcheck at warning level
 
 The tests replace ssh, cmux and fzf with stand-ins that answer in the shapes cmux really prints and record every call, so they run anywhere and assert on the exact commands cmux-berth would send.
 
+## How are versions numbered?
+
+With [semantic versioning](https://semver.org), released as git tags (`v0.1.0`) with notes on the [releases page](https://github.com/DivisionSt/cmux-berth/releases). Install a tag rather than `main` if you want to choose when you take changes.
+
+The interface the version number protects is the command's flags; the config keys and what they mean; the `CMUX_BERTH_*` environment variables; the session naming it expects; and the `cmux-berth:<repo>` key it gives the groups it creates. A change that breaks any of those is a major version; a new feature is a minor version; a fix is a patch. While the major version is 0, a minor version may still break something, and its release notes say what.
+
+## How do I report a problem or contribute?
+
+Bugs and ideas go in [issues](https://github.com/DivisionSt/cmux-berth/issues). Security problems go through the private route in [SECURITY.md](SECURITY.md). [CONTRIBUTING.md](CONTRIBUTING.md) says what to expect from a pull request and what it has to pass.
+
 ## License
 
 [MIT](LICENSE).

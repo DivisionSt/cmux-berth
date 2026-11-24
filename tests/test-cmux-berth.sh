@@ -169,7 +169,16 @@ colors() { sed 1d "$WORK/fzf-in" | cut -f1 | sed "s/[^$ESC]*$ESC\(\[[0-9;]*m\)[^
 check "picker: both columns colored on every line" \
     "$(colors | grep -c '^\[[0-9;]*m \[[0-9;]*m$')" "4"
 check "picker: a repo keeps one color" "$(colors | sed -n 2,3p | sort -u | wc -l | tr -d ' ')" "1"
-check "picker: repos get different colors" "$(colors | sort -u | wc -l | tr -d ' ')" "3"
+# A repo's hue comes from a hash of its name, the rule worktree-orchard uses,
+# so it is the same in both tools. Worked out here the same way, per line.
+pal="122;162;247 180;200;250|158;206;106 198;227;168|255;158;100 255;198;165|187;154;247 217;198;251|125;207;255 184;230;255|224;175;104 238;211;168|247;118;142 250;179;192|115;218;202 176;235;226"
+want_hues=$(sed 1d "$WORK/fzf-in" | cut -f1 | sed "s/$ESC\[[0-9;]*m//g" | awk '{print $1}' | while IFS= read -r r; do
+    sum=$(printf '%s' "$r" | cksum); sum=${sum%% *}
+    pair=$(printf '%s' "$pal" | cut -d'|' -f$(( sum % 8 + 1 )))
+    printf '[38;2;%sm [38;2;%sm\n' "${pair%% *}" "${pair##* }"
+done)
+check "picker: each repo's color is the hue its name hashes to" "$(colors)" "$want_hues"
+check "picker: these three repos hash to three different hues" "$(colors | sort -u | wc -l | tr -d ' ')" "3"
 check "picker: the two columns differ in shade" \
     "$(colors | awk '$1 == $2' | wc -l | tr -d ' ')" "0"
 check "picker: color ends before the session name" "$(cut -f2- "$WORK/fzf-in" | grep -c "$ESC")" "0"

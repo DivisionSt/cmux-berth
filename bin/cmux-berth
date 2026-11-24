@@ -158,21 +158,34 @@ if [ -z "$session" ]; then
   esac
   # One line per session, grouped by repo: the repo padded to the longest repo
   # name, then the session, then a tab and the plain session name, which is the
-  # part read back. fzf shows only what precedes the tab. Each repo takes the
-  # next color from the palette in alphabetical order, so neighbours never
-  # match; the repo gets the full shade and the session a lighter tint of it.
+  # part read back. fzf shows only what precedes the tab. Each repo takes one
+  # color from the palette by a hash of its name (cksum, modulo eight), the
+  # same rule worktree-orchard's list uses, so a repo is one color in both
+  # tools and on every run; two repos can share one. It was alphabetical
+  # order, which kept neighbours apart but moved a repo's color whenever the
+  # set of repos changed. The repo gets the full shade and the session a
+  # lighter tint of it. The hashes are worked out here rather than in awk,
+  # which has no cksum, and reach awk through the environment, because -v
+  # would rewrite a backslash in a name.
   # The first entry opens a plain shell. Its hidden name, :new, can never be a
   # session, because a colon fails the session-name check. The n key does the
   # same by leaving a mark file and aborting.
   mark=$(mktemp) && rm -f "$mark" || die "mktemp failed"
+  BERTH_HUES=$(printf '%s\n' "$listing" | cut -f2 | sort -u | while IFS= read -r r; do
+                 sum=$(printf '%s' "$r" | cksum); sum=${sum%% *}
+                 printf '%s\t%s\n' "$r" $(( sum % 8 + 1 ))
+               done)
+  export BERTH_HUES
   pick=$( { printf '+ new shell in ~\t:new\n'
             printf '%s\n' "$listing" | sort -t "$TAB" -k2,2 -k1,1 \
     | awk -F'\t' -v esc="$(printf '\033')" '
         BEGIN {
           n = split("122;162;247 180;200;250|158;206;106 198;227;168|255;158;100 255;198;165|187;154;247 217;198;251|125;207;255 184;230;255|224;175;104 238;211;168|247;118;142 250;179;192|115;218;202 176;235;226", pal, "|")
+          m = split(ENVIRON["BERTH_HUES"], hl, "\n")
+          for (j = 1; j <= m; j++) { t = index(hl[j], "\t"); if (t) hue[substr(hl[j], 1, t - 1)] = substr(hl[j], t + 1) + 0 }
         }
         { s[NR] = $1; r[NR] = $2; if (length($2) > w) w = length($2)
-          if (!($2 in hue)) hue[$2] = (k++ % n) + 1 }
+          if (!($2 in hue)) hue[$2] = 1 }
         END {
           for (i = 1; i <= NR; i++) {
             split(pal[hue[r[i]]], c, " ")
